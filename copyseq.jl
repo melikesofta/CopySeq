@@ -13,17 +13,17 @@ function main(args=ARGS)
 	s.description="Learning to copy sequences"
 	s.exc_handler=ArgParse.debug_handler
 	@add_arg_table s begin
-	("--datafiles"; nargs='+'; help="If provided, use first file for training, second for dev, others for test.")
-	("--hidden"; arg_type=Int; default=256; help="Sizes of one or more LSTM layers.")
-	("--embed"; arg_type=Int; default=256; help="Size of the embedding vector.")
-	("--epochs"; arg_type=Int; default=3; help="Number of epochs for training.")
-	("--batchsize"; arg_type=Int; default=1; help="Number of sequences to train on in parallel.")
-	("--lr"; arg_type=Float64; default=1.0; help="Initial learning rate.")
-	("--gclip"; arg_type=Float64; default=1.0; help="Value to clip the gradient norm at.")
-	("--winit"; arg_type=Float64; default=0.01; help="Initial weights set to winit*randn().")
-	("--seed"; arg_type=Int; default=42; help="Random number seed.")
-	("--atype"; default=(gpu()>=0 ? "KnetArray{Float32}" : "Array{Float32}"); help="array type: Array for cpu, KnetArray for gpu")
-	("--fast"; action=:store_true; help="skip loss printing for faster run")
+		("--datafiles"; nargs='+'; help="If provided, use first file for training, second for dev, others for test.")
+		("--hidden"; arg_type=Int; default=256; help="Sizes of one or more LSTM layers.")
+		("--embed"; arg_type=Int; default=256; help="Size of the embedding vector.")
+		("--epochs"; arg_type=Int; default=3; help="Number of epochs for training.")
+		("--batchsize"; arg_type=Int; default=1; help="Number of sequences to train on in parallel.")
+		("--lr"; arg_type=Float64; default=1.0; help="Initial learning rate.")
+		("--gclip"; arg_type=Float64; default=1.0; help="Value to clip the gradient norm at.")
+		("--winit"; arg_type=Float64; default=0.01; help="Initial weights set to winit*randn().")
+		("--seed"; arg_type=Int; default=42; help="Random number seed.")
+		("--atype"; default=(gpu()>=0 ? "KnetArray{Float32}" : "Array{Float32}"); help="array type: Array for cpu, KnetArray for gpu")
+		("--fast"; action=:store_true; help="skip loss printing for faster run")
 	end
 	println(s.description)
 	isa(args, AbstractString) && (args=split(args))
@@ -53,41 +53,47 @@ function train!(data, vocab; o=nothing)
 end
 
 function train1(params, state, sentence, vocab; o=nothing)
+	#println(loss(params, sentence, state, vocab; o=o))
 	gloss = lossgradient(params, sentence, state, vocab; o=o)
 	for i=1:length(params)
+		#println("gloss ", i, ": ", gloss[i][1])
 		params[i] -= o[:lr] * gloss[i]
 	end
-	for i = 1:length(state)
-		isa(state,Value) && error("State should not be a Value.")
-		state[i] = getval(state[i])
-	end
+	#for i = 1:length(state)
+	#	isa(state,Value) && error("State should not be a Value.")
+	#	state[i] = getval(state[i])
+	#end
 	return loss(params, sentence, state, vocab; o=o)
 end
 
-function loss(params, sentence, state, vocab; o=nothing) #divide loss by num of words
-	loss = 0
+function loss(params, sentence, state, vocab; o=nothing)
+	#encoder
 	decoding=false
 	for word in sentence
-		encdec(params, word, state, decoding; o=o)
+		state = encdec(params, word, state, decoding; o=o)
 	end
-	state[3]=state[1]
-	state[4]=state[2]
+
+	# copy encoder's hidden states to decoder
+	state[3]=copy(state[1])
+	state[4]=copy(state[2])
 	decoding=true
+
+	# give <eos> as the first token into decoder
 	ypred = zeros(o[:batchsize], vocab)
 	ypred[vocab] = 1.0
 	ypred = convert(o[:atype], ypred)
-	for word in sentence
-		ygold = word
-		ypred = encdec(params, ypred, state, decoding; o=o)
-		total = 0.0; count = 0
-		atype = typeof(getval(params[1]))
+
+	total = 0.0; count = 0 # for loss calculations
+	input = ypred
+
+	for ygold in sentence
+		state, ypred = encdec(params, input, state, decoding; o=o) #predict
 		ynorm = logp(ypred,2) # ypred .- log(sum(exp(ypred),2))
 		total += sum(ygold .* ynorm)
 		count += size(ygold,1)
-		loss += -total / count
+		input = ygold
 	end
-	nwords = length(sentence)
-	return loss / nwords
+	return -total/count
 end
 
 lossgradient = grad(loss)
@@ -121,12 +127,12 @@ end
 function encdec(params, x, state, decoding; o=nothing)
 	if !decoding
 		emb = x * params[5]
-		h = lstm(params, state, 1, emb)
+		state = lstm(params, state, 1, emb)
 	else
 		emb = x * params[6]
-		h = lstm(params, state, 3, emb)
-		ypred = h[3] * params[7] .+ params[8]
-		return exp(logp(ypred))
+		state = lstm(params, state, 3, emb)
+		ypred = state[3] * params[7] .+ params[8]
+		return state, ypred
 	end
 end
 
@@ -158,12 +164,13 @@ function process(datafile, batchsize, atype)
 					push!(line, copy(convert(atype, word)))
 				end
 				push!(data, copy(line))
+				empty!(line)
 		end
 	end
 	return data
 end
 
-function readvocab(file) # TODO: test with cmd e.g. `zcat foo.gz`
+function readvocab(file)
     d = Dict{Any,Int}()
     open(file) do f
         for l in eachline(f)
