@@ -43,18 +43,20 @@ function train!(data, vocab; o=nothing)
 	params = initparams(vocab, o[:hidden], o[:embed], o[:winit], o[:atype])
 	state = initstate(o[:atype], o[:hidden], o[:batchsize])
 	#TODO: do dev and test
-	for epoch=1:o[:epochs]
+	first_loss = true
+	for epoch=0:o[:epochs]
 		loss = 0
 		sent_cnt = 0
 		for sentence in data[1]
-			loss += train1(params, state, sentence, vocab; o=o)
+			loss += train1(params, state, sentence, vocab; first_loss=first_loss, o=o)
 			sent_cnt += 1
 		end
+		first_loss=false
 		println((:epoch,epoch,:loss,loss/sent_cnt))
 	end
 end
 
-function train1(params, state, sentence, vocab; o=nothing)
+function train1(params, state, sentence, vocab; first_loss=false, o=nothing)
 	gloss = lossgradient(params, sentence, state, vocab; o=o)
 	gscale = o[:lr]
 	gclip = o[:gclip]
@@ -65,13 +67,15 @@ function train1(params, state, sentence, vocab; o=nothing)
 		end
 	end
 	for k in 1:length(params)
+		first_loss && break
 		params[k] -= gscale * gloss[k]
 	end
 	for i = 1:length(state)
 		isa(state,Value) && error("State should not be a Value.")
 		state[i] = getval(state[i])
 	end
-	return loss(params, sentence, state, vocab; o=o)
+	lss = loss(params, sentence, state, vocab; o=o)
+	return lss
 end
 
 function loss(params, sentence, state, vocab; o=nothing)
@@ -97,13 +101,11 @@ function loss(params, sentence, state, vocab; o=nothing)
 	for ygold in sentence
 		state, ypred = encdec(params, input, state, decoding; o=o) #predict
 		ynorm = logp(ypred,2) # ypred .- log(sum(exp(ypred),2))
-		#	println(sum(ygold .* ynorm))
 		total += sum(ygold .* ynorm)
 		count += size(ygold,1)
 		input = ygold
 	end
-	#println("loss for sentence: ", total/count)
-	return total/count
+	return -total/count
 end
 
 lossgradient = grad(loss)
