@@ -21,6 +21,7 @@ function main(args=ARGS)
 	("--lr"; arg_type=Float64; default=1.0; help="Initial learning rate.")
   ("--gclip"; arg_type=Float64; default=3.0; help="Value to clip the gradient norm at.")
 	("--winit"; arg_type=Float64; default=0.01; help="Initial weights set to winit*randn().")
+ 	("--gcheck"; arg_type=Int; default=0; help="Check N random gradients.")
 	("--seed"; arg_type=Int; default=42; help="Random number seed.")
 	("--atype"; default=(gpu()>=0 ? "KnetArray{Float32}" : "Array{Float32}"); help="array type: Array for cpu, KnetArray for gpu")
 	("--fast"; action=:store_true; help="skip loss printing for faster run")
@@ -45,14 +46,17 @@ function train!(data, vocab; o=nothing)
 	#TODO: do dev and test
 	first_loss = true
 	for epoch=0:o[:epochs]
-		loss = 0
+		lss = 0
 		sent_cnt = 0
 		for sentence in data[1]
-			loss += train1(params, state, sentence, vocab; first_loss=first_loss, o=o)
+			lss += train1(params, state, sentence, vocab; first_loss=first_loss, o=o)
 			sent_cnt += 1
+			if o[:gcheck] > 0 && sent_cnt == 1 #check gradients only for one sentence
+			 	gradcheck(loss, params, sentence, copy(state), vocab; gcheck=o[:gcheck], o=o)
+		 	end
 		end
 		first_loss=false
-		println((:epoch,epoch,:loss,loss/sent_cnt))
+		println((:epoch,epoch,:loss,lss/sent_cnt))
 	end
 end
 
