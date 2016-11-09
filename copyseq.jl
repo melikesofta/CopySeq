@@ -6,14 +6,16 @@ an encoder-decoder machine translation model.
 """
 
 module CopySeq
-
 using Knet,AutoGrad,ArgParse,Compat
+include("S2SData.jl")
+include("SequencePerLine.jl")
 function main(args=ARGS)
 	s = ArgParseSettings()
 	s.description="Learning to copy sequences"
 	s.exc_handler=ArgParse.debug_handler
 	@add_arg_table s begin
 	("--datafiles"; nargs='+'; help="If provided, use first file for training, second for dev, others for test.")
+  ("--dictfile"; help="Dictionary file, first datafile used if not specified")
 	("--hidden"; arg_type=Int; default=256; help="Sizes of one or more LSTM layers.")
 	("--embed"; arg_type=Int; default=256; help="Size of the embedding vector.")
 	("--epochs"; arg_type=Int; default=3; help="Number of epochs for training.")
@@ -33,10 +35,11 @@ println("opts=",[(k,v) for (k,v) in o]...)
 o[:seed] > 0 && srand(o[:seed])
 o[:atype] = eval(parse(o[:atype]))
 global data = Any[]
+dict = (o[:dictfile] == nothing ? o[:datafiles][1] : o[:dictfile])
 for f in o[:datafiles]
-	push!(data, process(f, o[:batchsize], o[:atype]))
+	push!(data, S2SData(f; batchsize=o[:batchsize], atype=o[:atype], dense=true, dict=dict))
 end
-vocab = length(data[1][1][2])
+vocab = maxtoken(data[1], 2)
 train!(data, vocab; o=o)
 end
 
@@ -47,16 +50,31 @@ function train!(data, vocab; o=nothing)
 	first_loss = true
 	for epoch=0:o[:epochs]
 		lss = 0
-		sent_cnt = 0
-		for sentence in data[1]
-			lss += train1(params, state, sentence, vocab; first_loss=first_loss, o=o)
-			sent_cnt += 1
-			if o[:gcheck] > 0 && sent_cnt == 1 #check gradients only for one sentence
-				gradcheck(loss, params, sentence, copy(state), vocab; gcheck=o[:gcheck], o=o)
+		batch_cnt = 0
+		sentence = Any[]
+		decoding=false
+		for (x, ygold, mask) in data[1]
+	    if decoding && ygold == nothing # the next sentence started
+				gc()
+				if length(sentence)!=0
+					lss += train1(params, state, sentence, vocab; first_loss=first_loss, o=o)
+					batch_cnt += 1
+					if o[:gcheck] > 0 && batch_cnt == 1 #check gradients only for one batch
+						gradcheck(loss, params, sentence, copy(state), vocab; gcheck=o[:gcheck], o=o)
+					end
+		      empty!(sentence)
+				end
+	    	decoding = false
+	    end
+      if !decoding && ygold != nothing # source ended, target sequence started
+					decoding=true
 			end
-		end
+			if (!decoding && ygold == nothing) || (decoding && ygold != nothing)
+				push!(sentence, (x,ygold,mask))
+      end
+  	end
 		first_loss=false
-		println((:epoch,epoch,:loss,lss/sent_cnt))
+		println((:epoch,epoch,:loss,lss))#TODO: loss=?lss/batch_cnt))
 	end
 end
 
@@ -74,10 +92,10 @@ function train1(params, state, sentence, vocab; first_loss=false, o=nothing)
 		first_loss && break
 		params[k] -= gscale * gloss[k]
 	end
-	for i = 1:length(state)
-		isa(state,Value) && error("State should not be a Value.")
-		state[i] = getval(state[i])
-	end
+#	for i = 1:length(state)
+#		isa(state,Value) && error("State should not be a Value.")
+#		state[i] = getval(state[i])
+#	end
 	lss = loss(params, sentence, state, vocab; o=o)
 	return lss
 end
@@ -85,30 +103,33 @@ end
 function loss(params, sentence, state, vocab; o=nothing)
 	#encoder
 	decoding=false
-	for word in sentence
-		state = encdec(params, word, state, decoding; o=o)
-	end
+	total = 0.0
+	count = 0
+	input = nothing
+	for (x, ygold, mask) in sentence
+		#println(mask)
+		if !decoding && ygold == nothing # keep encoding source
+				state = encdec(params, x, state, decoding; o=o)
+		elseif !decoding && ygold != nothing # source ended, target sequence started
+				# copy encoder's hidden states to decoder
+				state[3]=copy(state[1])
+				state[4]=copy(state[2])
+				decoding=true
+				# give <eos> as the first token into decoder
+				ypred = zeros(o[:batchsize], vocab)
+				ypred[vocab] = 1
+				ypred = convert(o[:atype], ypred)
 
-	# copy encoder's hidden states to decoder
-	state[3]=copy(state[1])
-	state[4]=copy(state[2])
-	decoding=true
-
-	# give <eos> as the first token into decoder
-	ypred = zeros(o[:batchsize], vocab)
-	ypred[vocab] = 1
-	ypred = convert(o[:atype], ypred)
-
-	total = 0.0; count = 0 # for loss calculations
-	input = ypred
-
-	for ygold in sentence
-		state, ypred = encdec(params, input, state, decoding; o=o) #predict
-		ynorm = logp(ypred,2) # ypred .- log(sum(exp(ypred),2))
-		total += sum(ygold .* ynorm)
-		count += size(ygold,1)
-		input = ygold
-	end
+				total = 0.0; count = 0 # for loss calculations
+				input = ypred
+		elseif decoding && ygold != nothing # keep decoding target
+				state, ypred = encdec(params, input, state, decoding; o=o) #predict
+				ynorm = logp(ypred,2) # ypred .- log(sum(exp(ypred),2))
+				total += sum(ygold .* ynorm)
+				count += size(ygold,1)
+				input = ygold
+		end
+  end
 	return -total/count
 end
 
@@ -155,7 +176,7 @@ end
 function lstm(param,state,index,input; o=nothing)
 	(hidden,cell) = (state[index],state[index+1])
 	(weight,bias) = (param[index],param[index+1])
-	gates = hcat(input, hidden) * weight + bias
+	gates = hcat(input, hidden) * weight .+ bias
 	hsize = size(hidden, 2)
 	forget  = sigm(gates[:,1:hsize])
 	ingate  = sigm(gates[:,1+hsize:2hsize])
@@ -165,37 +186,6 @@ function lstm(param,state,index,input; o=nothing)
 	hidden  = outgate .* tanh(cell)
 	(state[index],state[index+1]) = (hidden,cell)
 	return state
-end
-
-function process(datafile, batchsize, atype)
-	#TODO: optimize memory usage
-	dict = readvocab(datafile)
-	data, line = Any[], Any[]
-	word = nothing
-	open(datafile) do f
-		for l in eachline(f)
-			for w in split(l)
-				word = zeros(Float64, batchsize, length(dict))
-				word[dict[w]] = 1.0
-				push!(line, copy(convert(atype, word)))
-			end
-			push!(data, copy(line))
-			empty!(line)
-		end
-	end
-	return data
-end
-
-function readvocab(file)
-	d = Dict{Any,Int}()
-	open(file) do f
-		for l in eachline(f)
-			for w in split(l)
-				get!(d, w, 1+length(d))
-			end
-		end
-	end
-	return d
 end
 
 end #module
