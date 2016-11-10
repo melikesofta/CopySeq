@@ -4,7 +4,6 @@ decoder, and the model learns to copy a sequence of words. The data is
 organised in a sequence-per-line manner. This example can be extended into
 an encoder-decoder machine translation model.
 """
-
 module CopySeq
 using Knet,AutoGrad,ArgParse,Compat
 include("S2SData.jl")
@@ -55,7 +54,6 @@ function train!(data, vocab; o=nothing)
 		decoding=false
 		for (x, ygold, mask) in data[1]
 	    if decoding && ygold == nothing # the next sentence started
-				gc()
 				if length(sentence)!=0
 					lss += train1(params, state, sentence, vocab; first_loss=first_loss, o=o)
 					batch_cnt += 1
@@ -74,7 +72,13 @@ function train!(data, vocab; o=nothing)
       end
   	end
 		first_loss=false
-		println((:epoch,epoch,:loss,lss))#TODO: loss=?lss/batch_cnt))
+
+		losses=Array(Float32, length(data)-1)
+		for i=2:length(data)
+			losses[i-1] = test(data[i], params, state, vocab; o=o)
+		end
+
+		println((:epoch,epoch,:trn_loss,lss/batch_cnt, :test_loss, losses...))
 	end
 end
 
@@ -98,6 +102,30 @@ function train1(params, state, sentence, vocab; first_loss=false, o=nothing)
 #	end
 	lss = loss(params, sentence, state, vocab; o=o)
 	return lss
+end
+
+function test(data, params, state, vocab; o=nothing)
+	lss = 0
+	batch_cnt = 0
+	sentence = Any[]
+	decoding=false
+	for (x, ygold, mask) in data
+		if decoding && ygold == nothing # the next sentence started
+			if length(sentence)!=0
+				lss += loss(params, sentence, state, vocab; o=o)
+				batch_cnt += 1
+				empty!(sentence)
+			end
+			decoding = false
+		end
+		if !decoding && ygold != nothing # source ended, target sequence started
+				decoding=true
+		end
+		if (!decoding && ygold == nothing) || (decoding && ygold != nothing)
+			push!(sentence, (x,ygold,mask))
+		end
+	end
+	return lss/batch_cnt
 end
 
 function loss(params, sentence, state, vocab; o=nothing)
@@ -188,4 +216,11 @@ function lstm(param,state,index,input; o=nothing)
 	return state
 end
 
+!isinteractive() && !isdefined(Core.Main,:load_only) && main(ARGS)
+
 end #module
+
+#TODO:
+#	optimize test, train and loss s2s_loops
+# solve S2SData memory problem
+# include JLD functionalities
