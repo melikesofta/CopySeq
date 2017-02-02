@@ -80,13 +80,14 @@ function sentenbatch(nom::Array{Any,1}, from::Int, batchsize::Int, vocabsize::In
     end
 
     scount = batchsize # modified future code
-    data = [ convert(KnetArray, zeros(Float32, scount, vocabsize)) for i=1:seqlen ]
+    data = [ zeros(Float32, scount, vocabsize) for i=1:seqlen ]
     for cursor=1:seqlen
         for row=1:scount
             index = sentences[row][cursor]
             data[cursor][row, index] = 1
         end
     end
+  	data = map(d->convert(KnetArray, d), data)
     return (data, new_from)
 end
 
@@ -108,7 +109,7 @@ end
 
 
 function start(s::Data)
-    sdict = copy(s.sequences)
+    sdict = deepcopy(s.sequences)
     clean_seqdict!(sdict, s.batchsize)
     slens = collect(keys(sdict))
     seqlen = pop!(slens)
@@ -155,12 +156,12 @@ function vocab_from_file(vocabfile)
     return V
 end
 # FUTURE CODE: if one day knet8 allows us to change batchsize on the fly, following lines will implement surplus batch implementation, this code snippet would be put on sentenbatch
-# (length(sentences) != batchsize) && (println("I am using the surplus sentences:) $from : $to"))
-# scount = length(sentences) # it can be either batchsize or the surplus sentences
-# data = [ falses(scount, vocabsize) for i=1:seqlen ]
-# for cursor=1:seqlen
-#     for row=1:scount
-#         index = sentences[row][cursor]
-#         data[cursor][row, index] = 1
-#     end
-# end
+    # (length(sentences) != batchsize) && (println("I am using the surplus sentences:) $from : $to"))
+    # scount = length(sentences) # it can be either batchsize or the surplus sentences
+    # data = [ falses(scount, vocabsize) for i=1:seqlen ]
+    # for cursor=1:seqlen
+    #     for row=1:scount
+    #         index = sentences[row][cursor]
+    #         data[cursor][row, index] = 1
+    #     end
+    # end
