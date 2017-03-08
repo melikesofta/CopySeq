@@ -1,3 +1,7 @@
+# TODO:
+# - Solve problem that causes the generator to copy only a few sentences
+# - Update gcheck to match current format
+
 for p in ("Knet","AutoGrad","ArgParse","Compat")
     Pkg.installed(p) == nothing && Pkg.add(p)
 end
@@ -24,7 +28,7 @@ module CopySeq
 
 using Knet,AutoGrad,ArgParse,Compat
 
-include("process.jl")
+include("preprocess.jl")
 
 function main(args=ARGS)
 	s = ArgParseSettings()
@@ -33,15 +37,15 @@ function main(args=ARGS)
 	@add_arg_table s begin
 	("--datafiles"; nargs='+'; help="If provided, use first file for training, second for dev, others for test.")
 	("--loadfile"; help="Initialize model from file")
-  ("--savefile"; help="Save final model to file")
-  ("--bestfile"; help="Save best model to file")
-  ("--dictfile"; help="Dictionary file, first datafile used if not specified")
+	("--savefile"; help="Save final model to file")
+	("--bestfile"; help="Save best model to file")
+	("--dictfile"; help="Dictionary file, first datafile used if not specified")
 	("--copy"; help="Generates a copy of the provided file")
 	("--hidden"; arg_type=Int; default=256; help="Sizes of one or more LSTM layers.")
 	("--embed"; arg_type=Int; default=256; help="Size of the embedding vector.")
 	("--epochs"; arg_type=Int; default=3; help="Number of epochs for training.")
 	("--batchsize"; arg_type=Int; default=1; help="Number of sequences to train on in parallel.")
-  ("--decay"; arg_type=Float64; default=0.9; help="Learning rate decay.")
+	("--decay"; arg_type=Float64; default=1.0; help="Learning rate decay.")
 	("--lr"; arg_type=Float64; default=2.0; help="Initial learning rate.")
 	("--gclip"; arg_type=Float64; default=5.0; help="Value to clip the gradient norm at.")
 	("--winit"; arg_type=Float64; default=0.10; help="Initial weights set to winit*randn().")
@@ -62,12 +66,12 @@ if any(f->(o[f]!=nothing), (:loadfile, :savefile, :bestfile))
 end
 if o[:loadfile]==nothing
 	global data = Any[]
-	push!(data, Data(o[:datafiles][1]; batchsize=o[:batchsize], vocabfile=nothing, serve_type="onehot"))
+	push!(data, Data(o[:datafiles][1]; batchsize=o[:batchsize], vocabfile=nothing))
 	dict=data[1].word_to_index
 	vocab=length(dict)
 	if length(o[:datafiles])>1
 		for i=2:length(o[:datafiles])
-			push!(data, Data(o[:datafiles][i]; batchsize=o[:batchsize], word_to_index=dict, serve_type="onehot"))
+			push!(data, Data(o[:datafiles][i]; batchsize=o[:batchsize], word_to_index=dict))
 		end
 	end
 	model = initparams(vocab, o[:hidden], o[:embed], o[:winit], o[:atype])
@@ -88,7 +92,7 @@ if o[:savefile] != nothing
 end
 if o[:copy] != nothing
 	state = initstate(o[:atype], o[:hidden], 1)
-	copydata = Data(o[:copy]; batchsize=1, word_to_index=dict, serve_type="onehot")
+	copydata = Data(o[:copy]; batchsize=1, word_to_index=dict)
 	copysequence(model, copy(state), vocab, copydata, o)
 end
 println(model[5]-model[6])
@@ -98,24 +102,27 @@ function train!(data, model, vocab, o)
 	state = initstate(o[:atype], o[:hidden], o[:batchsize])
 	if o[:fast]
 		@time (for epoch=1:o[:epochs]
-						for batch in data[1]
-					    train1(model, batch, state, vocab, o; gscale=o[:lr], gclip=o[:gclip])
-						end
-					end; gpu()>=0 && Knet.cudaDeviceSynchronize())
+					for batch in data[1]
+					    train1(model, batch, copy(state), vocab, o; gscale=o[:lr], gclip=o[:gclip])
+					end
+				end; gpu()>=0 && Knet.cudaDeviceSynchronize())
 		return
 	end
-	losses = map(d->test(d, model, copy(state), vocab, o), data)
-	println((:epoch,0,:loss,losses...))
+#	losses = map(d->test(d, model, copy(state), vocab, o), data)
+#	println((:epoch,0,:loss,losses...))
 	@time(for epoch=1:o[:epochs]
 		lss = 0
 		batch_cnt = 0
+		converted_data = Any[]
 		for batch in data[1]
-	    lss += train1(model, batch, state, vocab, o; gscale=o[:lr], gclip=o[:gclip])
+			converted_data = map(w->(convert(o[:atype]), w), batch)
+	    	lss += train1(model, converted_data, copy(state), vocab, o; gscale=o[:lr], gclip=o[:gclip])
 			batch_cnt += 1
 			if o[:gcheck] > 0 && batch_cnt == 1 #check gradients only for the first batch
-				gradcheck(loss, model, batch, copy(state), vocab, o; gcheck=o[:gcheck])
+				gradcheck(loss, model, batch, batch[2:end], copy(state), vocab, o; gcheck=o[:gcheck])
 			end
-  	end
+			empty!(converted_data)
+	  	end
 		losses=Array(Float32, length(data)-1)
 		for i=2:length(data)
 			losses[i-1] = test(data[i], model, state, vocab, o)
@@ -125,7 +132,7 @@ function train!(data, model, vocab, o)
 end
 
 function train1(params, batch, state, vocab, o; gscale=1.0, gclip=0)
-	gloss = lossgradient(params, batch, state, vocab, o)
+	gloss = lossgradient(params, batch, batch[2:end], copy(state), vocab, o)
 	if gclip > 0
 		gnorm = sqrt(mapreduce(sumabs2, +, 0, gloss))
 		if gnorm > gclip
@@ -138,23 +145,32 @@ function train1(params, batch, state, vocab, o; gscale=1.0, gclip=0)
 	isa(state,Vector{Any}) || error("State should not be Boxed.")
 	# The following is needed in case AutoGrad boxes state values during gradient calculation
 	for i = 1:length(state)
-    state[i] = AutoGrad.getval(state[i])
-  end
-	lss = loss(params, batch, state, vocab, o)
+    	state[i] = AutoGrad.getval(state[i])
+  	end
+	lss = loss(params, batch, batch[2:end], copy(state), vocab, o)
 	return lss
 end
 
 function test(data, params, state, vocab, o)
+
+	converted_data = Any[]
+	converted_batch = Any[]
+	for batch in data
+		converted_batch = map(w->convert(o[:atype], w), batch)
+		push!(converted_data, converted_batch)
+		empty!(converted_batch)
+	end
+
 	lss = 0
 	batch_cnt = 0
-	for batch in data
-		lss += loss(params, batch, state, vocab, o)
+	for batch in converted_data
+		lss += loss(params, batch, batch[2:end], copy(state), vocab, o)
 		batch_cnt += 1
 	end
 	return lss/batch_cnt
 end
 
-function loss(params, sentence, state, vocab, o)
+function loss(params, sentence, ysentence, state, vocab, o)
 	#encoder
 	total = 0.0; count = 0
 	decoding=false
@@ -165,15 +181,18 @@ function loss(params, sentence, state, vocab, o)
 	state[3]=copy(state[1])
 	state[4]=copy(state[2])
 	decoding=true
-
-	for word in sentence
+  for i=1:length(ysentence)
     #println(get_word(convert(Array{Float32}, word)[1,:]))
-		state, ypred = encdec(params, word, state, decoding) #predict
-    #println(get_word(convert(Array{Float32}, ypred)[1,:]))
+		state, ypred = encdec(params, sentence[i], state, decoding) #predict
+    try
+    # println(ypred)
+    # println(get_word(convert(Array{Float32}, ypred)[1,:]))
+    catch
+    end
 		ynorm = logp(ypred,2)
-		total += sum(word .* ynorm)
-		count += size(word,1)
-  end
+		total += sum(ysentence[i] .* ynorm)
+		count += size(ysentence[i],1)
+  	end
 	return -total/count
 end
 
@@ -231,39 +250,44 @@ function lstm(param,state,index,input)
 	return state
 end
 
-function copysequence(params, state, vocab, copydata, o)
-  for batch in copydata
-    o[:batchsize] = 1
-    println("loss: ", loss(params, batch, state, vocab, o))
+function copysequence(params, ostate, vocab, copydata, o)
+	converted_batch = Any[]
+	for batch in copydata
+		state = copy(ostate)
+		print("real sentence: ")
+		map(w->print(get_word(w)), batch)
+		converted_batch = map(w->convert(o[:atype], w), batch)
+		println()
+	    println("word count:", size(converted_batch))
+    	println("word size:", size(converted_batch[1]))
+    	o[:batchsize] = 1
+		println("loss: ", loss(params, converted_batch, converted_batch[2:end], copy(ostate), vocab, o))
 		decoding=false
-		for word in batch
-				state = encdec(params, word, state, decoding)
+		for word in converted_batch
+			state = encdec(params, word, state, decoding)
 		end
 		# copy encoder's hidden states to decoder
-		state[3]=copy(state[1])
-		state[4]=copy(state[2])
+		state[3]=state[1]
+		state[4]=state[2]
 		decoding=true
 		# give <s> as the first token into decoder
 		ypred = zeros(1, vocab)
 		ypred[1, 1] = 1
 		input = convert(o[:atype], ypred)
-    ind = 0
-    word_cnt=0
-    while (ind!=2 && word_cnt<30) #until end of sequence
-      word_cnt=word_cnt+1
+    	ind = 0
+    	word_cnt=0
+	    while (ind!=2 && word_cnt<300) #until end of sequence
+    		word_cnt=word_cnt+1
 			state, ypred = encdec(params, input, state, decoding) #predict
-      ynorm = exp(logp(ypred, 2))
-      #if (word_cnt==5)
-      #  println(convert(Array{Float32}, ynorm)[1, :])
-      #  println(convert(Array{Float32}, input))
-      #end
-      ind = indmax(convert(Array{Float32}, ynorm))
-      input = zeros(1, vocab)
-  		input[1, ind] = 1
-  		input = convert(o[:atype], input)
-      print(get_word(ynorm), " ")
-	  end
-    println()
+    		ind = indmax(convert(Array{Float32}, ypred))
+    		input = zeros(1, vocab)
+  			input[1, ind] = 1
+  			input = convert(o[:atype], input)
+     		print(copydata.index_to_word[ind], " ")
+    		#print(get_word(input), " ")
+		end
+    	println()
+    	empty!(converted_batch)
 	end
 end
 

@@ -1,8 +1,6 @@
 # Sequential preprocessor for large sized text files
 # Gather the sequences of the same length s.t. when it is called it brings batches of similar sequences with the help of iterables
 
-#TAKEN FROM https://github.com/kirnap/bilstm-in-Knet8/blob/master/preprocess.jl
-
 import Base: start, next, done
 
 
@@ -21,11 +19,13 @@ type Data
 end
 
 
-function Data(datafile; word_to_index=nothing, vocabfile=nothing, serve_type=nothing, batchsize=20)
-    (serve_type == nothing) && error("Please specify the data serve type: onehot, bitarray or sequence")
+function Data(datafile; word_to_index=nothing, vocabfile=nothing, serve_type="bitarray", batchsize=20)
+    # TODO: right now Data type can only be a bit array because of Knet support, no need to following line
+    # (serve_type == nothing) && error("Please specify the data serve type: onehot, bitarray or sequence")
     existing_vocab = (word_to_index != nothing)
     if !existing_vocab
         word_to_index = Dict{AbstractString, Int}(SOS=>1, EOS=>2, UNK=>3)
+        vocabfile != nothing && info("Working with provided vocabfile : $vocabfile")
         vocabfile != nothing && (V = vocab_from_file(vocabfile))
     end
 
@@ -70,24 +70,24 @@ function sentenbatch(nom::Array{Any,1}, from::Int, batchsize::Int, vocabsize::In
         warning("Surplus does not being cleaned correctly!")
         return (nothing, 1)
     end
-
+    
     new_from = (to == total) ? 1 : (to + 1)
     seqlen = length(nom[1]) # TODO: get rid of length computation give it as an extra argument!
     sentences = nom[from:to]
 
-    if serve_type == "lookup"
-        return (sentences, new_from)
-    end
+    # If Knet supports lookup that part will work correctly, it is commented for speed purposes
+    #if serve_type == "lookup"
+    #    return (sentences, new_from)
+    #end
 
     scount = batchsize # modified future code
-    data = [ zeros(Float32, scount, vocabsize) for i=1:seqlen ]
+    data = [ zeros(scount, vocabsize) for i=1:seqlen ]
     for cursor=1:seqlen
         for row=1:scount
             index = sentences[row][cursor]
             data[cursor][row, index] = 1
-        end
+        end   
     end
-  	data = map(d->convert(KnetArray, d), data)
     return (data, new_from)
 end
 
@@ -111,6 +111,7 @@ end
 function start(s::Data)
     sdict = deepcopy(s.sequences)
     clean_seqdict!(sdict, s.batchsize)
+    @assert (!isempty(sdict)) "There is not enough data with that batchsize $(s.batchsize)"
     slens = collect(keys(sdict))
     seqlen = pop!(slens)
     from = nothing
@@ -143,18 +144,35 @@ function done(s::Data, state)
 end
 
 
-""" Creates a set that contains all the words in that file, vocab file given as each vocab in a single line """
-function vocab_from_file(vocabfile)
+""" Creates a set that contains all the words in that file, vocab file given as each vocab in a single line
+    sorted_counted represents pure create_vocab.sh output
+"""
+function vocab_from_file(vocabfile; sorted_counted=false)
     V = Set{AbstractString}()
     open(vocabfile) do file
         for line in eachline(file)
             line = split(line)
-            # (length(line)>1) && push!(V, line[2]) # if the skeleton is given use that
-            !isempty(line) && push!(V, line[1])
+            if sorted_counted
+                (length(line)>1) && push!(V, line[2])
+            else
+                !isempty(line) && push!(V, line[1])
+            end
         end
     end
     return V
 end
+
+""" Builds the kth sentence from a given sequence """
+function ibuild_sentence(tdata::Data, sequence, kth::Int)
+    sentence = Array{Any, 1}()
+    for i=1:length(sequence)
+        z = find(x->x==1.0, sequence[i][kth,:])
+        append!(sentence, z)
+    end
+    ret = map(x->tdata.index_to_word[x], sentence)
+    return ret
+end
+
 # FUTURE CODE: if one day knet8 allows us to change batchsize on the fly, following lines will implement surplus batch implementation, this code snippet would be put on sentenbatch
     # (length(sentences) != batchsize) && (println("I am using the surplus sentences:) $from : $to"))
     # scount = length(sentences) # it can be either batchsize or the surplus sentences
@@ -163,5 +181,5 @@ end
     #     for row=1:scount
     #         index = sentences[row][cursor]
     #         data[cursor][row, index] = 1
-    #     end
+    #     end   
     # end
